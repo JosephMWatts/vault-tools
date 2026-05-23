@@ -1,0 +1,10 @@
+# Secrets and runtime state — never commit these
+config.json
+attempts.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
