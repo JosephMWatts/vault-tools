@@ -39,6 +39,7 @@ DEFAULT_MODEL  = "claude-sonnet-4-6"
 DEFAULT_MAXTOK = 16000
 MAX_ATTEMPTS   = 3
 STABILITY_WINDOW = 30   # seconds a file must be untouched before processing
+TITLE_SCAN_LINES = 15   # how far into the response to look for the TITLE marker
 
 # --- Locked enrichment prompt, v2 --------------------------------------
 ENRICHMENT_PROMPT = """ROLE
@@ -260,13 +261,21 @@ def call_claude(client, model, max_tokens, raw_json_text):
 
 
 def parse_response(text):
-    """Split the machine-readable TITLE line from the note body."""
+    """Split the machine-readable TITLE line from the note body.
+
+    The enrichment prompt asks for TITLE: on the first line, but the model
+    sometimes emits a short preamble above it. Scan the opening lines for
+    the marker rather than trusting line one, and discard everything up to
+    and including the TITLE line so no preamble leaks into the note body.
+    """
     text = text.strip()
     lines = text.split("\n")
-    if lines and lines[0].upper().startswith("TITLE:"):
-        title = lines[0].split(":", 1)[1].strip()
-        body = "\n".join(lines[1:]).strip()
-        return title or "Untitled Meeting", body
+    for i, line in enumerate(lines[:TITLE_SCAN_LINES]):
+        stripped = line.strip()
+        if stripped.upper().startswith("TITLE:"):
+            title = stripped.split(":", 1)[1].strip()
+            body = "\n".join(lines[i + 1:]).strip()
+            return title or "Untitled Meeting", body
     return "Untitled Meeting", text
 
 
