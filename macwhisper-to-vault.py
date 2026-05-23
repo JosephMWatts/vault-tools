@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,7 @@ VAULT_ENRICHED = HOME / "Documents" / "joseph_vault" / "Meetings" / "Enriched"
 DEFAULT_MODEL  = "claude-sonnet-4-6"
 DEFAULT_MAXTOK = 16000
 MAX_ATTEMPTS   = 3
+STABILITY_WINDOW = 30   # seconds a file must be untouched before processing
 
 # --- Locked enrichment prompt, v2 --------------------------------------
 ENRICHMENT_PROMPT = """ROLE
@@ -154,6 +156,17 @@ def load_config():
         log("ERROR config file has no anthropic_api_key")
         sys.exit(1)
     return cfg
+
+
+def is_stable(path):
+    """True if the file has not been modified within the stability window.
+
+    A file still being written by MacWhisper has a fresh mtime. Skipping
+    it this run avoids reading a half-written export. The next run picks
+    it up once the file has settled.
+    """
+    age = time.time() - path.stat().st_mtime
+    return age >= STABILITY_WINDOW
 
 
 def slugify(text):
@@ -384,6 +397,15 @@ def main():
     if not files:
         log("Inbox empty, nothing to do.")
         return
+
+    ready = [p for p in files if is_stable(p)]
+    for p in files:
+        if p not in ready:
+            log(f"SKIP {p.name} still settling, will retry next run")
+    if not ready:
+        log("Inbox has only files still being written, nothing to do.")
+        return
+    files = ready
 
     attempts = load_attempts()
     log(f"Found {len(files)} file(s) in inbox.")
