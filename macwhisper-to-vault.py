@@ -12,16 +12,21 @@ The Anthropic API key is never stored here. It loads at runtime from
 an untracked config file outside this repository.
 """
 
+from __future__ import annotations
+
 import json
 import re
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import anthropic
+
+import harness
 
 # --- Paths --------------------------------------------------------------
 HOME           = Path.home()
@@ -32,14 +37,19 @@ PROCESSED      = PIPELINE / "processed"
 FAILED         = PIPELINE / "failed"
 ATTEMPTS_PATH  = PIPELINE / "attempts.json"
 LOG_PATH       = PIPELINE / "pipeline.log"
-VAULT_RAW      = HOME / "Documents" / "joseph_vault" / "Meetings" / "Raw"
-VAULT_ENRICHED = HOME / "Documents" / "joseph_vault" / "Meetings" / "Enriched"
+VAULT_ROOT     = HOME / "Documents" / "joseph_vault"
+VAULT_RAW      = VAULT_ROOT / "Meetings" / "Raw"
+VAULT_ENRICHED = VAULT_ROOT / "Meetings" / "Enriched"
 
 DEFAULT_MODEL  = "claude-sonnet-4-6"
 DEFAULT_MAXTOK = 16000
 MAX_ATTEMPTS   = 3
 STABILITY_WINDOW = 30   # seconds a file must be untouched before processing
 TITLE_SCAN_LINES = 15   # how far into the response to look for the TITLE marker
+
+CONVERTER_AGENT_ID = "macwhisper-converter"
+ENRICHER_AGENT_ID  = "macwhisper-enricher"
+AGENT_VERSION      = "1.0.0"
 
 # --- Locked enrichment prompt, v2 --------------------------------------
 ENRICHMENT_PROMPT = """ROLE
@@ -177,17 +187,25 @@ def slugify(text):
     return s or "untitled-meeting"
 
 
-def unique_basename(meeting_date, title):
-    """Return a note filename not already used in Raw/ or Enriched/.
-
-    Guards against silently overwriting an existing vault note when two
-    meetings share a date and title. Appends -2, -3, ... until free.
-    """
-    slug = slugify(title)
+def unique_basename_in_raw(meeting_date, name):
+    """Return a filename free in Raw/. Source stem feeds the slug; Raw and
+    Enriched are now named independently so each checks only its own dir."""
+    slug = slugify(name)
     candidate = f"{meeting_date}-{slug}.md"
     n = 2
-    while (VAULT_RAW / candidate).exists() or \
-            (VAULT_ENRICHED / candidate).exists():
+    while (VAULT_RAW / candidate).exists():
+        candidate = f"{meeting_date}-{slug}-{n}.md"
+        n += 1
+    return candidate
+
+
+def unique_basename_in_enriched(meeting_date, name):
+    """Return a filename free in Enriched/. Claude-derived title feeds the
+    slug; mirrors unique_basename_in_raw but only checks Enriched/."""
+    slug = slugify(name)
+    candidate = f"{meeting_date}-{slug}.md"
+    n = 2
+    while (VAULT_ENRICHED / candidate).exists():
         candidate = f"{meeting_date}-{slug}-{n}.md"
         n += 1
     return candidate
@@ -239,10 +257,11 @@ def render_raw_note(segments, source_name, meeting_date, duration):
 
 
 def call_claude(client, model, max_tokens, raw_json_text):
-    """Send the export to Claude and return the markdown response.
+    """Send the export to Claude and return (markdown, usage).
 
-    Logs token usage for spend visibility, and warns if the response
-    hit the token ceiling and was probably truncated.
+    The enricher needs usage.input_tokens / output_tokens to populate
+    the v2 run-log's token_cost_* fields, so usage rides back with the
+    text rather than being logged-and-discarded.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     system_prompt = ENRICHMENT_PROMPT.replace("{{DATE}}", today)
@@ -257,7 +276,7 @@ def call_claude(client, model, max_tokens, raw_json_text):
     if resp.stop_reason == "max_tokens":
         log(f"  WARNING response hit the {max_tokens}-token ceiling, "
             f"the note is probably truncated and needs review")
-    return resp.content[0].text
+    return resp.content[0].text, usage
 
 
 def parse_response(text):
@@ -303,48 +322,166 @@ def build_enriched_note(title, body, source_name, meeting_date, duration):
     return header + body + footer
 
 
-# --- Per-file processing ------------------------------------------------
-def process_file(path, cfg, client):
-    """Process one export. Return True only on full success."""
-    log(f"Processing {path.name}")
-    raw_text = path.read_text()
-    try:
-        segments = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        log(f"  SKIP malformed JSON, left in inbox: {e}")
-        return False
-    if not isinstance(segments, list) or not segments:
-        log("  SKIP empty or non-array JSON, left in inbox")
-        return False
+# --- Per-file processing, split into two harness-instrumented agents ----
+@dataclass
+class ConverterResult:
+    """State the converter hands to the enricher. On failure, only status
+    and source_name are meaningful; the rest are None."""
+    status: str                       # "success" or "failed"
+    run_id: str | None
+    segments: list | None
+    raw_json_text: str | None         # original file contents, fed to Claude
+    meeting_date: str | None
+    duration: str | None
+    raw_basename: str | None
+    source_name: str
 
-    meeting_date = datetime.fromtimestamp(
-        path.stat().st_mtime).strftime("%Y-%m-%d")
-    duration = compute_duration(segments)
 
+def _compute_run_id(started_at, agent_id):
+    """Mirror harness.write_run_log's internal recipe so the converter can
+    hand its own run_id to the enricher as parent_run_id without round-
+    tripping through the filesystem."""
+    return f"{started_at:%Y-%m-%d-%H%M}-{agent_id.replace('-', '')}"
+
+
+def run_converter(path, cfg):
+    """Stage 1: parse the MacWhisper export, write the raw note, move the
+    source to processed/, emit a v2 run-log. Returns a ConverterResult."""
+    log(f"CONVERTER {path.name}")
+    started_at = datetime.now().astimezone()
+    run_id = _compute_run_id(started_at, CONVERTER_AGENT_ID)
     try:
-        response = call_claude(
-            client, cfg.get("model", DEFAULT_MODEL),
-            cfg.get("max_tokens", DEFAULT_MAXTOK), raw_text)
+        raw_json_text = path.read_text()
+        try:
+            segments = json.loads(raw_json_text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"malformed JSON: {e}") from e
+        if not isinstance(segments, list) or not segments:
+            raise ValueError("empty or non-array JSON")
+
+        meeting_date = datetime.fromtimestamp(
+            path.stat().st_mtime).strftime("%Y-%m-%d")
+        duration = compute_duration(segments)
+
+        raw_md = render_raw_note(segments, path.name, meeting_date, duration)
+        VAULT_RAW.mkdir(parents=True, exist_ok=True)
+        raw_basename = unique_basename_in_raw(meeting_date, path.stem)
+        raw_path = VAULT_RAW / raw_basename
+        raw_path.write_text(raw_md)
+        log(f"  WROTE Raw/{raw_basename}")
+
+        PROCESSED.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(PROCESSED / path.name))
+        log(f"  MOVED {path.name} to processed/")
+
+        harness.write_run_log(
+            vault_path=str(VAULT_ROOT),
+            agent_id=CONVERTER_AGENT_ID,
+            agent_version=AGENT_VERSION,
+            started_at=started_at,
+            completed_at=datetime.now().astimezone(),
+            status="success",
+            trigger="manual",
+            input_summary=f"{len(segments)} segments from {path.name}",
+            output_summary=f"Raw note: {raw_basename}",
+            output_paths=[str(raw_path)],
+            parent_run_id=None,
+            model_id=None,
+        )
+        return ConverterResult(
+            status="success",
+            run_id=run_id,
+            segments=segments,
+            raw_json_text=raw_json_text,
+            meeting_date=meeting_date,
+            duration=duration,
+            raw_basename=raw_basename,
+            source_name=path.name,
+        )
     except Exception as e:
-        log(f"  SKIP Claude API error, left in inbox: {e}")
+        harness.write_run_log(
+            vault_path=str(VAULT_ROOT),
+            agent_id=CONVERTER_AGENT_ID,
+            agent_version=AGENT_VERSION,
+            started_at=started_at,
+            completed_at=datetime.now().astimezone(),
+            status="failed",
+            trigger="manual",
+            input_summary=f"file: {path.name}",
+            output_summary=str(e),
+            output_paths=[],
+            error=str(e),
+            parent_run_id=None,
+            model_id=None,
+        )
+        log(f"  CONVERTER FAILED, left in inbox: {e}")
+        return ConverterResult(
+            status="failed",
+            run_id=None,
+            segments=None,
+            raw_json_text=None,
+            meeting_date=None,
+            duration=None,
+            raw_basename=None,
+            source_name=path.name,
+        )
+
+
+def run_enricher(cr, cfg, client):
+    """Stage 2: send the export to Claude, write the enriched note, emit a
+    chained v2 run-log linked to the converter via parent_run_id. Returns
+    True on success, False on any failure."""
+    log(f"ENRICHER {cr.source_name}")
+    started_at = datetime.now().astimezone()
+    model_id = cfg.get("model", DEFAULT_MODEL)
+    try:
+        text, usage = call_claude(
+            client, model_id,
+            cfg.get("max_tokens", DEFAULT_MAXTOK), cr.raw_json_text)
+        title, body = parse_response(text)
+        enriched_md = build_enriched_note(
+            title, body, cr.source_name, cr.meeting_date, cr.duration)
+        VAULT_ENRICHED.mkdir(parents=True, exist_ok=True)
+        enriched_basename = unique_basename_in_enriched(cr.meeting_date, title)
+        enriched_path = VAULT_ENRICHED / enriched_basename
+        enriched_path.write_text(enriched_md)
+        log(f"  WROTE Enriched/{enriched_basename}")
+
+        harness.write_run_log(
+            vault_path=str(VAULT_ROOT),
+            agent_id=ENRICHER_AGENT_ID,
+            agent_version=AGENT_VERSION,
+            started_at=started_at,
+            completed_at=datetime.now().astimezone(),
+            status="success",
+            trigger="chained",
+            input_summary=f"Enrich {cr.source_name}",
+            output_summary=f"Enriched note: {enriched_basename}",
+            output_paths=[str(enriched_path)],
+            parent_run_id=cr.run_id,
+            model_id=model_id,
+            token_cost_input=usage.input_tokens,
+            token_cost_output=usage.output_tokens,
+        )
+        return True
+    except Exception as e:
+        harness.write_run_log(
+            vault_path=str(VAULT_ROOT),
+            agent_id=ENRICHER_AGENT_ID,
+            agent_version=AGENT_VERSION,
+            started_at=started_at,
+            completed_at=datetime.now().astimezone(),
+            status="failed",
+            trigger="chained",
+            input_summary=f"Enrich {cr.source_name}",
+            output_summary=str(e),
+            output_paths=[],
+            error=str(e),
+            parent_run_id=cr.run_id,
+            model_id=model_id,
+        )
+        log(f"  ENRICHER FAILED: {e}")
         return False
-
-    title, body = parse_response(response)
-    raw_md = render_raw_note(segments, path.name, meeting_date, duration)
-    enriched_md = build_enriched_note(
-        title, body, path.name, meeting_date, duration)
-
-    VAULT_RAW.mkdir(parents=True, exist_ok=True)
-    VAULT_ENRICHED.mkdir(parents=True, exist_ok=True)
-    basename = unique_basename(meeting_date, title)
-    (VAULT_RAW / basename).write_text(raw_md)
-    (VAULT_ENRICHED / basename).write_text(enriched_md)
-    log(f"  WROTE {basename} to Raw/ and Enriched/")
-
-    PROCESSED.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), str(PROCESSED / path.name))
-    log(f"  MOVED {path.name} to processed/")
-    return True
 
 
 # --- Retry cap, quarantine, and notification ---------------------------
@@ -422,7 +559,9 @@ def main():
     for path in files:
         ok = False
         try:
-            ok = process_file(path, cfg, client)
+            cr = run_converter(path, cfg)
+            if cr.status == "success":
+                ok = run_enricher(cr, cfg, client)
         except Exception as e:
             log(f"  ERROR unhandled while processing {path.name}, "
                 f"left in inbox: {e}")
