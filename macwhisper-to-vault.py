@@ -38,7 +38,7 @@ PROCESSED      = PIPELINE / "processed"
 FAILED         = PIPELINE / "failed"
 ATTEMPTS_PATH  = PIPELINE / "attempts.json"
 LOG_PATH       = PIPELINE / "pipeline.log"
-VAULT_ROOT     = HOME / "Documents" / "joseph_vault"
+VAULT_ROOT     = HOME / "joseph_vault"
 VAULT_RAW      = VAULT_ROOT / "Meetings" / "Raw"
 VAULT_ENRICHED = VAULT_ROOT / "Meetings" / "Enriched"
 

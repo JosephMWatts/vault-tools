@@ -26,7 +26,7 @@ from pathlib import Path
 
 import harness
 
-VAULT_ROOT      = Path("/Users/josephwatts/Documents/joseph_vault")
+VAULT_ROOT      = Path("/Users/josephwatts/joseph_vault")
 PRICING_PATH    = VAULT_ROOT / "_pricing.yml"
 AGENT_RUNS_DIR  = VAULT_ROOT / "Agent Runs"
 
@@ -333,6 +333,10 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Parse and compute, print a summary table, write nothing.",
     )
+    ap.add_argument(
+        "--trigger", default="manual",
+        help="Trigger value to write into the run-log frontmatter (e.g. 'manual', 'scheduled').",
+    )
     args = ap.parse_args()
 
     started_at = datetime.now().astimezone()
@@ -398,7 +402,7 @@ def main() -> None:
             started_at=started_at,
             completed_at=datetime.now().astimezone(),
             status="success",
-            trigger="manual",
+            trigger=args.trigger,
             input_summary=f"Walked {total} run-log(s) in Agent Runs/",
             output_summary=summary,
             output_paths=[],
@@ -414,7 +418,7 @@ def main() -> None:
                 started_at=started_at,
                 completed_at=datetime.now().astimezone(),
                 status="failed",
-                trigger="manual",
+                trigger=args.trigger,
                 input_summary="cost-reporter pass over Agent Runs/",
                 output_summary=str(e),
                 output_paths=[],

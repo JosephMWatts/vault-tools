@@ -1,6 +1,6 @@
 #!/bin/bash
 
-INPUT_DIR=~/Documents/joseph_vault/CPMAI/Source\ Material
+INPUT_DIR=~/joseph_vault/CPMAI/Source\ Material
 
 for pdf in "$INPUT_DIR"/*.pdf; do
     md="${pdf%.pdf}.md"
