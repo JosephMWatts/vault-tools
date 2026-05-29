@@ -15,6 +15,7 @@ an untracked config file outside this repository.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -50,6 +51,7 @@ TITLE_SCAN_LINES = 15   # how far into the response to look for the TITLE marker
 CONVERTER_AGENT_ID = "macwhisper-converter"
 ENRICHER_AGENT_ID  = "macwhisper-enricher"
 AGENT_VERSION      = "1.0.0"
+TRIGGER            = os.environ.get("TRIGGER", "manual")
 
 # --- Locked enrichment prompt, v2 --------------------------------------
 ENRICHMENT_PROMPT = """ROLE
@@ -381,7 +383,7 @@ def run_converter(path, cfg):
             started_at=started_at,
             completed_at=datetime.now().astimezone(),
             status="success",
-            trigger="manual",
+            trigger=TRIGGER,
             input_summary=f"{len(segments)} segments from {path.name}",
             output_summary=f"Raw note: {raw_basename}",
             output_paths=[str(raw_path)],
@@ -406,7 +408,7 @@ def run_converter(path, cfg):
             started_at=started_at,
             completed_at=datetime.now().astimezone(),
             status="failed",
-            trigger="manual",
+            trigger=TRIGGER,
             input_summary=f"file: {path.name}",
             output_summary=str(e),
             output_paths=[],
